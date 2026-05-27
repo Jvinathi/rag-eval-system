@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Data (don't commit uploaded files or vector DB)
+backend/data/uploads/
+backend/data/chroma_db/
+
+# Environment
+.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
