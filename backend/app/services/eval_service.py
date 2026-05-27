@@ -1,70 +1,113 @@
 import logging
+import asyncio
 from typing import List, Optional
 from datetime import datetime
-import asyncio
-
-from datasets import Dataset
-from ragas import evaluate
-from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    context_precision,
-)
-from langchain_community.llms import Ollama as LangchainOllama
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from app.config import settings
 from app.models.schemas import EvalMetrics, EvalResponse
 
 logger = logging.getLogger(__name__)
 
-# Store evaluation history in memory (for dashboard)
+# Store evaluation history in memory
 eval_history: List[dict] = []
 
 
-def get_ragas_llm_and_embeddings():
+def run_ragas_evaluation(question: str, answer: str, contexts: List[str], ground_truth: str) -> dict:
     """
-    RAGAS needs LangChain-compatible LLM and embeddings.
-    We use the same free Ollama + HuggingFace models.
+    This function runs RAGAS evaluation SYNCHRONOUSLY.
+    We run it in a separate thread via asyncio.run_in_executor
+    so it doesn't block FastAPI's async event loop.
+
+    WHY SEPARATE FUNCTION:
+    RAGAS internally uses its own event loop calls.
+    Mixing it with FastAPI's async loop causes freezes.
+    Running in executor = separate thread = no conflict.
     """
-    llm = LangchainOllama(
-        model=settings.OLLAMA_MODEL,
-        base_url=settings.OLLAMA_BASE_URL,
-        temperature=0.1,
-    )
-    
-    embeddings = HuggingFaceEmbeddings(
-        model_name=settings.EMBED_MODEL,
-        model_kwargs={"device": "cpu"},
-    )
-    
-    return llm, embeddings
+    try:
+        # ── Import here (not at top) to avoid circular import issues ──
+        from datasets import Dataset
+        from ragas import evaluate
+        from ragas.metrics import (
+            faithfulness,
+            answer_relevancy,
+            context_precision,
+        )
+        from langchain_community.llms import Ollama as LangchainOllama
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        logger.info("Initializing RAGAS models...")
+
+        # ── LLM for RAGAS: use LangChain Ollama with high timeout ──
+        llm = LangchainOllama(
+            model=settings.OLLAMA_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+            temperature=0.1,
+            timeout=settings.RAGAS_OLLAMA_TIMEOUT,   # ✅ 10 minutes
+            num_predict=512,                          # limit output tokens → faster
+        )
+
+        # ── Embedding model: same HuggingFace model ──
+        embeddings = HuggingFaceEmbeddings(
+            model_name=settings.EMBED_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+
+        logger.info("Running RAGAS evaluation (this takes 2-5 minutes)...")
+
+        # ── Build dataset in RAGAS format ──
+        eval_data = {
+            "question":     [question],
+            "answer":       [answer],
+            "contexts":     [contexts],       # list of lists
+            "ground_truth": [ground_truth or answer],  # fallback to answer if no ground truth
+        }
+        dataset = Dataset.from_dict(eval_data)
+
+        # ── Run evaluation ──
+        result = evaluate(
+            dataset=dataset,
+            metrics=[
+                faithfulness,
+                answer_relevancy,
+                context_precision,
+            ],
+            llm=llm,
+            embeddings=embeddings,
+            raise_exceptions=False,   # ✅ don't crash on partial failures
+        )
+
+        # ── Safely extract scores (handle NaN/None) ──
+        def safe_score(key: str) -> float:
+            try:
+                val = result[key]
+                if val is None:
+                    return 0.0
+                score = float(val)
+                # NaN check
+                return score if score == score else 0.0
+            except Exception:
+                return 0.0
+
+        return {
+            "faithfulness":      safe_score("faithfulness"),
+            "answer_relevancy":  safe_score("answer_relevancy"),
+            "context_precision": safe_score("context_precision"),
+            "error": None,
+        }
+
+    except Exception as e:
+        logger.error(f"RAGAS evaluation failed: {e}", exc_info=True)
+        return {
+            "faithfulness":      0.0,
+            "answer_relevancy":  0.0,
+            "context_precision": 0.0,
+            "error": str(e),
+        }
 
 
 class EvalService:
-    """
-    Evaluates RAG system quality using RAGAS metrics:
-    
-    1. FAITHFULNESS: Is the answer grounded in the retrieved context?
-       (0 = hallucinated, 1 = fully supported by context)
-    
-    2. ANSWER RELEVANCY: Does the answer actually address the question?
-       (0 = irrelevant, 1 = perfectly relevant)
-    
-    3. CONTEXT PRECISION: Are the retrieved chunks actually useful?
-       (0 = retrieved junk, 1 = retrieved perfect chunks)
-    """
-    
-    def __init__(self):
-        self._llm = None
-        self._embeddings = None
-    
-    def _get_models(self):
-        """Lazy-load models to avoid startup delay."""
-        if self._llm is None:
-            self._llm, self._embeddings = get_ragas_llm_and_embeddings()
-        return self._llm, self._embeddings
-    
+
     async def evaluate_response(
         self,
         question: str,
@@ -73,104 +116,75 @@ class EvalService:
         ground_truth: Optional[str] = None,
     ) -> EvalResponse:
         """
-        Run RAGAS evaluation on a single Q&A pair.
-        
-        Args:
-            question: The user's question
-            answer: The RAG system's answer
-            contexts: List of retrieved document chunks
-            ground_truth: Optional correct answer (for reference)
-        
-        Returns:
-            EvalResponse with all metric scores
+        Runs RAGAS evaluation in a thread pool executor.
+
+        WHY EXECUTOR:
+        - RAGAS is synchronous (blocking) code
+        - FastAPI is async
+        - Running blocking code directly in async freezes the entire server
+        - run_in_executor moves it to a separate thread → server stays responsive
         """
-        logger.info(f"Evaluating response for: {question[:80]}...")
-        
-        llm, embeddings = self._get_models()
-        
-        # RAGAS expects data in this specific format
-        eval_data = {
-            "question": [question],
-            "answer": [answer],
-            "contexts": [contexts],  # List of lists
-            "ground_truth": [ground_truth or ""],
-        }
-        
-        dataset = Dataset.from_dict(eval_data)
-        
-        # Run evaluation (this calls Ollama locally)
-        try:
-            # Run in thread to avoid blocking async event loop
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: evaluate(
-                    dataset,
-                    metrics=[
-                        faithfulness,
-                        answer_relevancy,
-                        context_precision,
-                    ],
-                    llm=llm,
-                    embeddings=embeddings,
-                    raise_exceptions=False,
-                )
-            )
-            
-            # Extract scores (default to 0 if evaluation fails)
-            faith_score = float(result["faithfulness"] or 0.0)
-            relevancy_score = float(result["answer_relevancy"] or 0.0)
-            precision_score = float(result["context_precision"] or 0.0)
-            
-        except Exception as e:
-            logger.error(f"RAGAS evaluation error: {e}")
-            # Provide default scores with error note
-            faith_score = 0.0
-            relevancy_score = 0.0
-            precision_score = 0.0
-        
-        # Calculate overall score (simple average)
-        overall = (faith_score + relevancy_score + precision_score) / 3
-        
+        logger.info(f"Starting RAGAS evaluation for: '{question[:80]}...'")
+
+        loop = asyncio.get_event_loop()
+
+        # ✅ Run blocking RAGAS code in thread pool — won't freeze FastAPI
+        scores = await loop.run_in_executor(
+            None,   # uses default ThreadPoolExecutor
+            run_ragas_evaluation,
+            question,
+            answer,
+            contexts,
+            ground_truth or "",
+        )
+
+        if scores.get("error"):
+            logger.warning(f"Evaluation had errors: {scores['error']}")
+
+        overall = (
+            scores["faithfulness"] +
+            scores["answer_relevancy"] +
+            scores["context_precision"]
+        ) / 3
+
         metrics = EvalMetrics(
-            faithfulness=round(faith_score, 4),
-            answer_relevancy=round(relevancy_score, 4),
-            context_precision=round(precision_score, 4),
+            faithfulness=round(scores["faithfulness"], 4),
+            answer_relevancy=round(scores["answer_relevancy"], 4),
+            context_precision=round(scores["context_precision"], 4),
             overall_score=round(overall, 4),
         )
-        
+
         timestamp = datetime.now().isoformat()
-        
-        # Store in history for dashboard
+
+        # Store in history
         eval_history.append({
-            "timestamp": timestamp,
-            "question": question[:100],
-            "faithfulness": metrics.faithfulness,
+            "timestamp":        timestamp,
+            "question":         question[:100],
+            "faithfulness":     metrics.faithfulness,
             "answer_relevancy": metrics.answer_relevancy,
             "context_precision": metrics.context_precision,
-            "overall_score": metrics.overall_score,
+            "overall_score":    metrics.overall_score,
         })
-        
-        # Keep only last 50 evaluations in memory
+
         if len(eval_history) > 50:
             eval_history.pop(0)
-        
-        logger.info(f"Eval complete — Faithfulness: {faith_score:.3f}, "
-                   f"Relevancy: {relevancy_score:.3f}, "
-                   f"Precision: {precision_score:.3f}")
-        
+
+        logger.info(
+            f"Evaluation done — F:{metrics.faithfulness:.3f} "
+            f"R:{metrics.answer_relevancy:.3f} "
+            f"P:{metrics.context_precision:.3f}"
+        )
+
         return EvalResponse(
             metrics=metrics,
             timestamp=timestamp,
             question=question,
         )
-    
+
     def get_history(self) -> List[dict]:
-        """Return evaluation history for dashboard."""
         return eval_history
-    
+
     def get_summary_stats(self) -> dict:
-        """Calculate average metrics across all evaluations."""
         if not eval_history:
             return {
                 "total_evaluations": 0,
@@ -179,24 +193,14 @@ class EvalService:
                 "avg_context_precision": 0.0,
                 "avg_overall": 0.0,
             }
-        
         n = len(eval_history)
         return {
             "total_evaluations": n,
-            "avg_faithfulness": round(
-                sum(e["faithfulness"] for e in eval_history) / n, 4
-            ),
-            "avg_answer_relevancy": round(
-                sum(e["answer_relevancy"] for e in eval_history) / n, 4
-            ),
-            "avg_context_precision": round(
-                sum(e["context_precision"] for e in eval_history) / n, 4
-            ),
-            "avg_overall": round(
-                sum(e["overall_score"] for e in eval_history) / n, 4
-            ),
+            "avg_faithfulness": round(sum(e["faithfulness"] for e in eval_history) / n, 4),
+            "avg_answer_relevancy": round(sum(e["answer_relevancy"] for e in eval_history) / n, 4),
+            "avg_context_precision": round(sum(e["context_precision"] for e in eval_history) / n, 4),
+            "avg_overall": round(sum(e["overall_score"] for e in eval_history) / n, 4),
         }
 
 
-# Single instance
 eval_service = EvalService()

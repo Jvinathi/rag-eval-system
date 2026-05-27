@@ -148,23 +148,29 @@ export default function QueryPanel({ collectionName, onEvalComplete }) {
           )}
 
           {/* Evaluate Button */}
-          <button
-            onClick={handleEvaluate}
-            disabled={evaluating || response.sources.length === 0}
-            className="w-full bg-[#21262d] hover:bg-[#30363d] disabled:opacity-50
-                       disabled:cursor-not-allowed text-white font-semibold py-2 px-4
-                       rounded-lg transition-colors flex items-center justify-center gap-2
-                       border border-[#30363d] text-sm"
-          >
-            {evaluating ? (
-              <>
-                <Loader2 size={14} className="animate-spin" />
-                Running RAGAS Evaluation...
-              </>
-            ) : (
-              "🔬 Evaluate with RAGAS"
-            )}
-          </button>
+<button
+  onClick={handleEvaluate}
+  disabled={evaluating || response.sources.length === 0}
+  className="w-full bg-[#21262d] hover:bg-[#30363d] disabled:opacity-50
+             disabled:cursor-not-allowed text-white font-semibold py-2 px-4
+             rounded-lg transition-colors flex items-center justify-center gap-2
+             border border-[#30363d] text-sm"
+>
+  {evaluating ? (
+    <div className="flex flex-col items-center gap-1 py-1">
+      <div className="flex items-center gap-2">
+        <Loader2 size={14} className="animate-spin" />
+        <span>Running RAGAS Evaluation...</span>
+      </div>
+      {/* ✅ Tell user why it's slow */}
+      <span className="text-xs text-gray-500">
+        This takes 2–5 min. Ollama is running multiple LLM calls internally.
+      </span>
+    </div>
+  ) : (
+    "🔬 Evaluate with RAGAS"
+  )}
+</button>
         </div>
       )}
     </div>
